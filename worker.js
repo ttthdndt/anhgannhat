@@ -37,6 +37,18 @@ export default {
   async fetch(request, env) {
     const reqOrigin = request.headers.get("Origin") || "";
     const allowedOrigin = (env.ALLOWED_ORIGIN || "").trim().replace(/\/$/, "");
+    const pathname = new URL(request.url).pathname;
+    // Endpoint kiểm tra công khai, không lộ token hoặc mật mã.
+    // Cho phép website biết rõ Worker có hoạt động và ALLOWED_ORIGIN có khớp không.
+    if (request.method === "GET" && pathname === "/health") {
+      return sendJSON({
+        ok: true,
+        service: "github-photo-uploader",
+        allowed_origin: allowedOrigin,
+        github_configured: Boolean(env.GITHUB_TOKEN && env.GITHUB_OWNER && env.GITHUB_REPO),
+        upload_key_required: Boolean(env.UPLOAD_KEY)
+      }, 200, "*");
+    }
     if (!allowedOrigin || reqOrigin !== allowedOrigin) {
       return sendJSON({ error: "Trang truy cập không được phép." }, 403);
     }
@@ -111,8 +123,39 @@ export default {
         body: JSON.stringify(body)
       });
       if (!githubResponse.ok) {
-        console.log("GitHub upload failed: HTTP", githubResponse.status);
-        return sendJSON({ error: `GitHub từ chối lưu ảnh (HTTP ${githubResponse.status}). Kiểm tra token, quyền Contents và tên repo.` }, 502, reqOrigin);
+        // GitHub 403 co nhieu nguyen nhan: quyen, token khong dung, rate limit...
+        // Tra ve message that cua GitHub (khong tra token, URL bi mat hay headers auth).
+        let githubMessage = "Không có thông tin chi tiết từ GitHub";
+        try {
+          const errorBody = await githubResponse.json();
+          if (typeof errorBody.message === "string") {
+            githubMessage = errorBody.message.slice(0, 500);
+          }
+        } catch {}
+        const remaining = githubResponse.headers.get("x-ratelimit-remaining");
+        const retryAfter = githubResponse.headers.get("retry-after");
+        const requestId = githubResponse.headers.get("x-github-request-id");
+        console.warn("GitHub upload error", {
+          status: githubResponse.status,
+          message: githubMessage,
+          requestId,
+          remaining,
+          retryAfter
+        });
+        let hint = "Kiểm tra Secret GITHUB_TOKEN trên Cloudflare (token vừa tạo phải được dán vào Worker).";
+        if (/rate limit/i.test(githubMessage) || remaining === "0") {
+          hint = "GitHub đang giới hạn API. Không thử liên tục; chờ hết thời hạn giới hạn rồi thử lại.";
+        } else if (/not accessible|permission|forbidden|access denied/i.test(githubMessage)) {
+          hint = "Kiểm tra token trong Cloudflare có phải token MỚI, Resource owner đúng và Contents: Read and write đã được lưu.";
+        } else if (/protected branch|branch protection|repository rule/i.test(githubMessage)) {
+          hint = "Nhánh mặc định có thể bị bảo vệ bởi quy tắc của repository.";
+        }
+        return sendJSON({
+          error: `GitHub HTTP ${githubResponse.status}: ${githubMessage}. ${hint}`,
+          github_status: githubResponse.status,
+          github_message: githubMessage,
+          github_request_id: requestId
+        }, 502, reqOrigin);
       }
       return sendJSON({ ok: true, path }, 201, reqOrigin);
     } catch (error) {

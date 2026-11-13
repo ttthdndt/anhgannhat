@@ -76,6 +76,36 @@
       return { ok: response.ok, status: response.status, body };
     }
 
+    async function diagnoseConnection() {
+      let base;
+      try {
+        const url = new URL(WORKER_URL);
+        if (url.protocol !== "https:" || !url.hostname) throw new Error("invalid");
+        base = WORKER_URL.replace(/\/$/, "");
+      } catch {
+        return "URL Worker không hợp lệ. Kiểm tra dòng WORKER_URL trong index.html.";
+      }
+      if (location.protocol === "file:") {
+        return "Bạn đang mở file trực tiếp. Hãy dùng đường dẫn GitHub Pages (https://...).";
+      }
+      try {
+        const response = await fetch(base + "/health", { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok || data.service !== "github-photo-uploader") {
+          return "Worker chưa chạy đúng phiên bản. Hãy thay worker.js bằng bản mới rồi Deploy.";
+        }
+        if (!data.allowed_origin || data.allowed_origin !== location.origin) {
+          return `Sai ALLOWED_ORIGIN: Cloudflare đang đặt '${data.allowed_origin || "(trống)"}', cần đặt '${location.origin}'.`;
+        }
+        if (!data.github_configured) {
+          return "Worker chưa có đủ GITHUB_TOKEN, GITHUB_OWNER hoặc GITHUB_REPO.";
+        }
+        return "Worker hoạt động nhưng yêu cầu tải ảnh bị chặn. Kiểm tra tab Network/Console hoặc Deploy lại Worker.";
+      } catch {
+        return "Không truy cập được Worker hoặc /health bị chặn. Kiểm tra URL Worker, Deploy và thử mở URL Worker + /health.";
+      }
+    }
+
     picker.addEventListener("change", async () => {
       const file = picker.files?.[0];
       picker.value = ""; // Cho phep chon lai chinh anh vua chon.
@@ -98,7 +128,12 @@
         if (!result.ok) throw new Error(result.body.error || `Không tải được ảnh (HTTP ${result.status}).`);
         show("✓ Đã lưu ảnh vào thư mục uploads!", "success");
       } catch (error) {
-        show(error instanceof TypeError ? "Không kết nối được máy chủ. Kiểm tra URL Worker và cấu hình CORS." : (error.message || "Đã xảy ra lỗi."), "error");
+        if (error instanceof TypeError) {
+          show("Đang kiểm tra kết nối Worker...");
+          show(await diagnoseConnection(), "error");
+        } else {
+          show(error.message || "Đã xảy ra lỗi.", "error");
+        }
       } finally {
         busy = false;
         area.setAttribute("aria-busy", "false");
